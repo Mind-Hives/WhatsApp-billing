@@ -28,7 +28,7 @@ type NumbersSelectQuery = SupabaseQuery<LocalNumberRow[]> & {
 };
 
 type SupabaseClientLike = {
-  from(table: "numbers"): {
+  from(table: "phone_numbers"): {
     select(columns: string): NumbersSelectQuery;
     update(payload: { twilio_status: DatabaseTwilioStatus }): {
       eq(column: string, value: string): SupabaseQuery<null>;
@@ -52,7 +52,7 @@ type TwilioClientLike = {
 
 interface LocalNumberRow {
   id: string;
-  phone_number: string;
+  e164_number: string;
   twilio_status: DatabaseTwilioStatus;
   assignment_status?: string;
   billing_status?: string;
@@ -199,13 +199,13 @@ function diffLocalRows(localRows: LocalNumberRow[], inventory: Map<string, Twili
   let missingCount = 0;
 
   for (const row of localRows) {
-    const twilioEntry = inventory.get(row.phone_number);
+    const twilioEntry = inventory.get(row.e164_number);
     const nextStatus: DatabaseTwilioStatus = twilioEntry?.status ?? "missing";
 
     if (!twilioEntry) {
       missingCount += 1;
     } else if (twilioEntry.isUnexpectedRawStatus) {
-      unexpectedRawStatuses.push({ phoneNumber: row.phone_number, rawStatus: twilioEntry.rawStatus });
+      unexpectedRawStatuses.push({ phoneNumber: row.e164_number, rawStatus: twilioEntry.rawStatus });
     }
 
     if (row.twilio_status === nextStatus) {
@@ -285,11 +285,11 @@ async function selectLocalNumbers(
 ): Promise<LocalNumberRow[]> {
   try {
     let query = supabase
-      .from("numbers")
-      .select("id, phone_number, twilio_status, assignment_status, billing_status");
+      .from("phone_numbers")
+      .select("id, e164_number, twilio_status, assignment_status, billing_status");
 
     if (input.scope === "targeted" && input.phoneNumbers?.length) {
-      query = query.in("phone_number", input.phoneNumbers);
+      query = query.in("e164_number", input.phoneNumbers);
     }
 
     const { data, error } = await query;
@@ -318,7 +318,7 @@ async function persistStatusChange(
   const updatePayload = { twilio_status: change.nextStatus };
 
   const { error: updateError } = await supabase
-    .from("numbers")
+    .from("phone_numbers")
     .update(updatePayload)
     .eq("id", change.row.id);
 
@@ -364,7 +364,7 @@ export async function syncTwilioNumbers(input: SyncTwilioNumbersInput): Promise<
   const supabase = createAdminClient() as unknown as SupabaseClientLike;
   const localRows = await selectLocalNumbers(supabase, input);
   const { changes, unchangedCount, missingCount, unexpectedRawStatuses } = diffLocalRows(localRows, twilioInventory);
-  const localPhoneNumbers = new Set(localRows.map((row) => row.phone_number));
+  const localPhoneNumbers = new Set(localRows.map((row) => row.e164_number));
   const upstreamOnlyCount = [...twilioInventory.keys()].filter((phoneNumber) => !localPhoneNumbers.has(phoneNumber)).length;
 
   logTwilioSync("diff-complete", {

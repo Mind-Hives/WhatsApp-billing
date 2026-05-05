@@ -1,4 +1,5 @@
 import { createAdminClient } from "@/utils/supabase/admin";
+import type { NormalizedImportRow } from "./contract";
 
 export interface CommitBatchInput {
   batchId: string;
@@ -10,220 +11,244 @@ export interface CommitBatchResult {
   skipped: number;
 }
 
-// Escape PostgreSQL ILIKE special chars so the pattern is treated as a literal.
-function escapeLike(s: string): string {
-  return s.replace(/[\\%_]/g, (c) => "\\" + c);
+type CompanyRow = { id: string; name: string };
+type EmployeeRow = { id: string; company_id: string; full_name: string; email: string | null };
+type PhoneNumberRow = { id: string; e164_number: string };
+type AssignmentRow = {
+  id: string;
+  phone_number_id: string;
+  employee_id: string | null;
+  company_id: string;
+};
+
+function escapeLike(value: string) {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+async function findOrCreateCompany(
+  supabase: ReturnType<typeof createAdminClient>,
+  row: NormalizedImportRow
+) {
+  const { data: existing, error: findError } = await supabase
+    .from("companies")
+    .select("id, name")
+    .ilike("name", escapeLike(row.company_name))
+    .maybeSingle<CompanyRow>();
+  if (findError) {
+    throw findError;
+  }
+  if (existing) {
+    return existing;
+  }
+
+  const { data, error } = await supabase
+    .from("companies")
+    .insert({
+      name: row.company_name,
+      billing_status: "active",
+      lago_external_customer_id: null,
+    })
+    .select("id, name")
+    .single<CompanyRow>();
+  if (error || !data) {
+    throw error ?? new Error("Company insert returned no row");
+  }
+  return data;
+}
+
+async function findOrCreateEmployee(
+  supabase: ReturnType<typeof createAdminClient>,
+  companyId: string,
+  row: NormalizedImportRow
+) {
+  let query = supabase
+    .from("employees")
+    .select("id, company_id, full_name, email")
+    .eq("company_id", companyId);
+
+  query = row.employee_email
+    ? query.eq("email", row.employee_email)
+    : query.ilike("full_name", escapeLike(row.employee_name ?? ""));
+
+  const { data: existing, error: findError } = await query.maybeSingle<EmployeeRow>();
+  if (findError) {
+    throw findError;
+  }
+  if (existing) {
+    const { data, error } = await supabase
+      .from("employees")
+      .update({
+        full_name: row.employee_name ?? existing.full_name,
+        working_location: row.working_location,
+        department: row.department,
+        status: "active",
+      })
+      .eq("id", existing.id)
+      .select("id, company_id, full_name, email")
+      .single<EmployeeRow>();
+    if (error || !data) {
+      throw error ?? new Error("Employee update returned no row");
+    }
+    return data;
+  }
+
+  const { data, error } = await supabase
+    .from("employees")
+    .insert({
+      company_id: companyId,
+      full_name: row.employee_name ?? row.employee_email ?? "Unknown employee",
+      email: row.employee_email,
+      working_location: row.working_location,
+      department: row.department,
+      status: "active",
+    })
+    .select("id, company_id, full_name, email")
+    .single<EmployeeRow>();
+  if (error || !data) {
+    throw error ?? new Error("Employee insert returned no row");
+  }
+  return data;
+}
+
+async function findOrCreatePhoneNumber(
+  supabase: ReturnType<typeof createAdminClient>,
+  row: NormalizedImportRow
+) {
+  const { data, error } = await supabase
+    .from("phone_numbers")
+    .upsert(
+      {
+        e164_number: row.phone_number,
+        twilio_sid: row.twilio_sid,
+        billing_status: row.billing_status,
+        notes: row.notes,
+      },
+      { onConflict: "e164_number" }
+    )
+    .select("id, e164_number")
+    .single<PhoneNumberRow>();
+  if (error || !data) {
+    throw error ?? new Error("Phone number upsert returned no row");
+  }
+  return data;
+}
+
+async function getActiveAssignment(
+  supabase: ReturnType<typeof createAdminClient>,
+  phoneNumberId: string
+) {
+  const { data, error } = await supabase
+    .from("number_assignments")
+    .select("id, phone_number_id, company_id, employee_id")
+    .eq("phone_number_id", phoneNumberId)
+    .eq("status", "active")
+    .is("assigned_to", null)
+    .maybeSingle<AssignmentRow>();
+  if (error) {
+    throw error;
+  }
+  return data;
 }
 
 export async function commitBatch(
   input: CommitBatchInput
 ): Promise<CommitBatchResult> {
-  const { batchId, actorUserId } = input;
   const supabase = createAdminClient();
+  const now = new Date().toISOString();
 
-  // 1. Already-committed guard
-  const { data: batchRow, error: batchLookupError } = await supabase
+  const { data: batch, error: batchError } = await supabase
     .from("import_batches")
-    .select("status")
-    .eq("id", batchId)
-    .maybeSingle();
-
-  if (batchLookupError) {
-    console.error(
-      `[imports] batch lookup failed batch_id=${batchId}: ${batchLookupError.message}`
-    );
-    throw batchLookupError;
+    .select("id, status")
+    .eq("id", input.batchId)
+    .maybeSingle<{ id: string; status: string }>();
+  if (batchError) {
+    throw batchError;
   }
-
-  if (batchRow?.status === "committed") {
-    console.log(`[imports] batch already committed batch_id=${batchId}`);
+  if (!batch || !["pending_review", "not_committable"].includes(batch.status)) {
     return { committed: 0, skipped: 0 };
   }
 
-  // 2. Fetch valid items
   const { data: items, error: itemsError } = await supabase
     .from("import_items")
-    .select("*")
-    .eq("batch_id", batchId)
-    .eq("status", "valid");
-
+    .select("id, normalized_row, status")
+    .eq("batch_id", input.batchId)
+    .eq("status", "ready");
   if (itemsError) {
-    console.error(
-      `[imports] items lookup failed batch_id=${batchId}: ${itemsError.message}`
-    );
     throw itemsError;
   }
 
-  const validItems = items ?? [];
   let committed = 0;
   let skipped = 0;
 
-  // 3. Per-item production writes
-  for (const item of validItems) {
-    // a. Company SELECT-then-INSERT
-    // companies_name_unique_idx is on lower(name); upsert on 'name' won't hit it.
-    // Use ilike with escaped pattern for case-insensitive exact match.
-    const { data: existingCompany, error: companySelectError } = await supabase
-      .from("companies")
-      .select("id")
-      .ilike("name", escapeLike(item.company_name ?? ""))
-      .maybeSingle();
+  for (const item of items ?? []) {
+    const row = item.normalized_row as NormalizedImportRow;
+    const company = await findOrCreateCompany(supabase, row);
+    const employee = await findOrCreateEmployee(supabase, company.id, row);
+    const phoneNumber = await findOrCreatePhoneNumber(supabase, row);
+    const activeAssignment = await getActiveAssignment(supabase, phoneNumber.id);
 
-    if (companySelectError) {
-      console.error(
-        `[imports] company select failed batch_id=${batchId} company=${item.company_name}: ${companySelectError.message}`
-      );
-      throw companySelectError;
-    }
-
-    let companyId: string;
-
-    if (existingCompany) {
-      console.log(
-        `[imports] company exists batch_id=${batchId} company_id=${existingCompany.id}`
-      );
-      companyId = existingCompany.id;
+    if (
+      activeAssignment &&
+      activeAssignment.company_id === company.id &&
+      activeAssignment.employee_id === employee.id
+    ) {
+      skipped += 1;
     } else {
-      const insertPayload: { name: string; billing_email?: string } = {
-        name: item.company_name,
-      };
-      if (item.user_email) {
-        insertPayload.billing_email = item.user_email;
+      if (activeAssignment) {
+        const { error: closeError } = await supabase
+          .from("number_assignments")
+          .update({ assigned_to: now, status: "ended" })
+          .eq("id", activeAssignment.id);
+        if (closeError) {
+          throw closeError;
+        }
       }
 
-      const { data: newCompany, error: companyInsertError } = await supabase
-        .from("companies")
-        .insert(insertPayload)
-        .select("id")
-        .single();
-
-      if (companyInsertError || !newCompany) {
-        console.error(
-          `[imports] company insert failed batch_id=${batchId} company=${item.company_name}: ${companyInsertError?.message ?? "no data"}`
-        );
-        throw companyInsertError ?? new Error("[imports] company insert returned no data");
-      }
-
-      console.log(
-        `[imports] company inserted batch_id=${batchId} company_id=${newCompany.id}`
-      );
-      companyId = newCompany.id;
-    }
-
-    // b. Number upsert — numbers_phone_number_unique_idx is a plain unique index.
-    // numbers table has no company_id column; association is via assignment_history.
-    const { data: numberRow, error: numberUpsertError } = await supabase
-      .from("numbers")
-      .upsert(
-        {
-          phone_number: item.phone_number,
-          twilio_status: "unknown",
-          assignment_status: "unassigned",
-          billing_status: "inactive",
-        },
-        { onConflict: "phone_number" }
-      )
-      .select("id")
-      .single();
-
-    if (numberUpsertError || !numberRow) {
-      console.error(
-        `[imports] number upsert failed batch_id=${batchId} phone=${item.phone_number}: ${numberUpsertError?.message ?? "no data"}`
-      );
-      throw numberUpsertError ?? new Error("[imports] number upsert returned no data");
-    }
-
-    const numberId = numberRow.id;
-
-    // c. Assignment history open-guard
-    // assignment_history_open_number_unique_idx is PARTIAL on (number_id) WHERE assigned_to IS NULL.
-    const { data: openAssignment, error: assignmentSelectError } = await supabase
-      .from("assignment_history")
-      .select("id")
-      .eq("number_id", numberId)
-      .is("assigned_to", null)
-      .maybeSingle();
-
-    if (assignmentSelectError) {
-      console.error(
-        `[imports] assignment select failed batch_id=${batchId} number_id=${numberId}: ${assignmentSelectError.message}`
-      );
-      throw assignmentSelectError;
-    }
-
-    if (openAssignment) {
-      console.log(
-        `[imports] open assignment exists number_id=${numberId} batch_id=${batchId}`
-      );
-      skipped++;
-    } else {
-      const { error: assignmentInsertError } = await supabase
-        .from("assignment_history")
+      const { error: assignmentError } = await supabase
+        .from("number_assignments")
         .insert({
-          number_id: numberId,
-          company_id: companyId,
-          assigned_from: new Date().toISOString(),
+          phone_number_id: phoneNumber.id,
+          employee_id: employee.id,
+          company_id: company.id,
+          assigned_from: now,
+          status: "active",
+          source: "csv",
         });
-
-      if (assignmentInsertError) {
-        console.error(
-          `[imports] assignment insert failed batch_id=${batchId} number_id=${numberId}: ${assignmentInsertError.message}`
-        );
-        throw assignmentInsertError;
+      if (assignmentError) {
+        throw assignmentError;
       }
+      committed += 1;
+    }
 
-      committed++;
+    const { error: itemUpdateError } = await supabase
+      .from("import_items")
+      .update({ status: "committed" })
+      .eq("id", item.id);
+    if (itemUpdateError) {
+      throw itemUpdateError;
     }
   }
 
-  // 4. Bulk-update items to 'committed'
-  const { error: itemsUpdateError } = await supabase
-    .from("import_items")
-    .update({ status: "committed" })
-    .eq("batch_id", batchId)
-    .eq("status", "valid");
-
-  if (itemsUpdateError) {
-    console.error(
-      `[imports] items update failed batch_id=${batchId}: ${itemsUpdateError.message}`
-    );
-    throw itemsUpdateError;
-  }
-
-  // 5. Update batch status
   const { error: batchUpdateError } = await supabase
     .from("import_batches")
-    .update({ status: "committed" })
-    .eq("id", batchId);
-
+    .update({
+      status: "committed",
+      committed_at: new Date().toISOString(),
+    })
+    .eq("id", input.batchId);
   if (batchUpdateError) {
-    console.error(
-      `[imports] batch update failed batch_id=${batchId}: ${batchUpdateError.message}`
-    );
     throw batchUpdateError;
   }
 
-  // 6. Audit log — uses new_values to store commit metadata (no 'metadata' column in schema)
-  const { error: auditError } = await supabase.from("audit_logs").insert({
+  await supabase.from("audit_logs").insert({
+    actor_type: "admin",
+    actor_id: input.actorUserId,
+    action: "csv_import_commit",
     entity_type: "import_batch",
-    entity_id: batchId,
-    action: "commit",
-    source: "admin",
-    actor_user_id: actorUserId,
+    entity_id: input.batchId,
+    source: "csv",
     new_values: { committed, skipped },
   });
-
-  if (auditError) {
-    console.error(
-      `[imports] audit log insert failed batch_id=${batchId}: ${auditError.message}`
-    );
-    throw auditError;
-  }
-
-  // 7. Final structured log
-  console.log(
-    `[imports] committed batch_id=${batchId} committed=${committed} skipped=${skipped}`
-  );
 
   return { committed, skipped };
 }

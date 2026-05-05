@@ -69,6 +69,8 @@ vendor/
 coverage/
 .cache/
 tmp/
+.npm-cache/
+graphify/
 
 # Playwright
 /test-results/

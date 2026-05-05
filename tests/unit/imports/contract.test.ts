@@ -1,202 +1,180 @@
 import { describe, it, expect } from "vitest";
-import { normalizeRow, normalizePhone, validateEnvelope } from "@/features/imports/contract";
+import {
+  normalizePhone,
+  normalizeRow,
+  parseCsv,
+  validateEnvelope,
+  validateRows,
+} from "@/features/imports/contract";
 
 describe("normalizePhone", () => {
   it("accepts E.164 format unchanged", () => {
-    expect(normalizePhone("+15551234567")).toEqual({ e164: "+15551234567", error: null });
+    expect(normalizePhone("+15551234567")).toEqual({
+      e164: "+15551234567",
+      error: null,
+    });
   });
 
   it("normalizes US 10-digit to E.164", () => {
-    expect(normalizePhone("5551234567")).toEqual({ e164: "+15551234567", error: null });
+    expect(normalizePhone("5551234567")).toEqual({
+      e164: "+15551234567",
+      error: null,
+    });
   });
 
-  it("normalizes US 11-digit (leading 1) to E.164", () => {
-    expect(normalizePhone("15551234567")).toEqual({ e164: "+15551234567", error: null });
+  it("normalizes US 11-digit with leading 1 to E.164", () => {
+    expect(normalizePhone("15551234567")).toEqual({
+      e164: "+15551234567",
+      error: null,
+    });
   });
 
-  it("normalizes formatted phone number", () => {
-    expect(normalizePhone("(555) 123-4567")).toEqual({ e164: "+15551234567", error: null });
+  it("normalizes formatted phone numbers", () => {
+    expect(normalizePhone("(555) 123-4567")).toEqual({
+      e164: "+15551234567",
+      error: null,
+    });
+    expect(normalizePhone("555-123-4567")).toEqual({
+      e164: "+15551234567",
+      error: null,
+    });
   });
 
-  it("normalizes phone with dashes", () => {
-    expect(normalizePhone("555-123-4567")).toEqual({ e164: "+15551234567", error: null });
+  it("returns errors for unnormalizable phone values", () => {
+    expect(normalizePhone("not-a-phone").error).toContain("E.164");
+    expect(normalizePhone("12345").error).not.toBeNull();
   });
+});
 
-  it("returns error for non-numeric garbage", () => {
-    const { e164, error } = normalizePhone("not-a-phone");
-    expect(e164).toBeNull();
-    expect(error).toContain("E.164");
-  });
-
-  it("returns error for too-short number", () => {
-    const { e164, error } = normalizePhone("12345");
-    expect(e164).toBeNull();
-    expect(error).not.toBeNull();
+describe("parseCsv", () => {
+  it("parses headers, rows, and quoted commas", () => {
+    expect(
+      parseCsv('phone_number,company_name,notes\n5551234567,Acme,"main, line"')
+    ).toEqual([
+      {
+        phone_number: "5551234567",
+        company_name: "Acme",
+        notes: "main, line",
+      },
+    ]);
   });
 });
 
 describe("normalizeRow", () => {
-  describe("valid rows", () => {
-    it("normalizes a fully valid row", () => {
-      const result = normalizeRow({
-        companyName: "Acme Corp",
-        userEmail: "ops@acme.internal",
-        phoneNumber: "+15551234567",
-      });
-      expect(result.status).toBe("valid");
-      expect(result.validationError).toBeNull();
-      expect(result.companyName).toBe("Acme Corp");
-      expect(result.userEmail).toBe("ops@acme.internal");
-      expect(result.phoneNumber).toBe("+15551234567");
+  it("normalizes a fully valid CSV row", () => {
+    const result = normalizeRow({
+      company_name: " Acme Corp ",
+      employee_name: "Ada Lovelace",
+      employee_email: "ADA@ACME.COM",
+      phone_number: "5551234567",
+      working_location: "NYC",
+      department: "Ops",
+      billing_status: "billable",
     });
 
-    it("normalizes US 10-digit phone to E.164", () => {
-      const result = normalizeRow({
-        companyName: "Acme Corp",
-        phoneNumber: "5551234567",
-      });
-      expect(result.status).toBe("valid");
-      expect(result.phoneNumber).toBe("+15551234567");
-    });
-
-    it("normalizes a formatted phone number", () => {
-      const result = normalizeRow({
-        companyName: "Acme Corp",
-        phoneNumber: "(555) 123-4567",
-      });
-      expect(result.status).toBe("valid");
-      expect(result.phoneNumber).toBe("+15551234567");
-    });
-
-    it("accepts a row without userEmail", () => {
-      const result = normalizeRow({
-        companyName: "Acme Corp",
-        phoneNumber: "+15551234567",
-      });
-      expect(result.status).toBe("valid");
-      expect(result.userEmail).toBeNull();
-    });
-
-    it("lowercases userEmail", () => {
-      const result = normalizeRow({
-        companyName: "Acme",
-        userEmail: "OPS@Acme.COM",
-        phoneNumber: "+15551234567",
-      });
-      expect(result.status).toBe("valid");
-      expect(result.userEmail).toBe("ops@acme.com");
-    });
-
-    it("trims whitespace from companyName", () => {
-      const result = normalizeRow({
-        companyName: "  Acme Corp  ",
-        phoneNumber: "+15551234567",
-      });
-      expect(result.status).toBe("valid");
-      expect(result.companyName).toBe("Acme Corp");
-    });
-
-    it("populates normalizedRecord for valid rows", () => {
-      const result = normalizeRow({
-        companyName: "Acme",
-        phoneNumber: "+15551234567",
-      });
-      expect(result.normalizedRecord).toMatchObject({
-        companyName: "Acme",
-        phoneNumber: "+15551234567",
-        userEmail: null,
-      });
+    expect(result.status).toBe("ready");
+    expect(result.errorMessages).toEqual([]);
+    expect(result.normalizedRow).toMatchObject({
+      company_name: "Acme Corp",
+      employee_name: "Ada Lovelace",
+      employee_email: "ada@acme.com",
+      phone_number: "+15551234567",
+      working_location: "NYC",
+      department: "Ops",
+      billing_status: "billable",
     });
   });
 
-  describe("validation_error rows", () => {
-    it("rejects a string instead of object", () => {
-      const result = normalizeRow("not an object");
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("must be an object");
+  it("accepts employee name without email and defaults billing_status", () => {
+    const result = normalizeRow({
+      company_name: "Acme",
+      employee_name: "Ada Lovelace",
+      phone_number: "+15551234567",
     });
 
-    it("rejects null", () => {
-      const result = normalizeRow(null);
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("must be an object");
+    expect(result.status).toBe("ready");
+    expect(result.normalizedRow).toMatchObject({
+      employee_email: null,
+      billing_status: "billable",
+    });
+  });
+
+  it("accepts employee email without name", () => {
+    const result = normalizeRow({
+      company_name: "Acme",
+      employee_email: "ops@acme.internal",
+      phone_number: "+15551234567",
     });
 
-    it("rejects an array", () => {
-      const result = normalizeRow([]);
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("must be an object");
+    expect(result.status).toBe("ready");
+    expect(result.normalizedRow?.employee_name).toBeNull();
+    expect(result.normalizedRow?.employee_email).toBe("ops@acme.internal");
+  });
+
+  it("rejects non-object rows", () => {
+    const result = normalizeRow("not an object");
+    expect(result.status).toBe("validation_error");
+    expect(result.errorMessages).toContain("row must be an object");
+    expect(result.normalizedRow).toBeNull();
+  });
+
+  it("accumulates validation errors", () => {
+    const result = normalizeRow({
+      company_name: "",
+      phone_number: "",
+      billing_status: "maybe",
     });
 
-    it("rejects blank companyName", () => {
-      const result = normalizeRow({ companyName: "  ", phoneNumber: "+15551234567" });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("companyName is required");
+    expect(result.status).toBe("validation_error");
+    expect(result.errorMessages).toContain("company_name is required");
+    expect(result.errorMessages).toContain("phone_number is required");
+    expect(result.errorMessages).toContain(
+      "employee_name or employee_email is required"
+    );
+    expect(result.errorMessages).toContain(
+      "billing_status must be billable, excluded, suspended, or non_billable"
+    );
+  });
+
+  it("rejects malformed employee_email", () => {
+    const result = normalizeRow({
+      company_name: "Acme",
+      employee_email: "not-an-email",
+      phone_number: "+15551234567",
     });
 
-    it("rejects missing companyName", () => {
-      const result = normalizeRow({ phoneNumber: "+15551234567" });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("companyName is required");
-    });
+    expect(result.status).toBe("validation_error");
+    expect(result.errorMessages).toContain(
+      "employee_email is not a valid email address"
+    );
+  });
+});
 
-    it("rejects non-string companyName", () => {
-      const result = normalizeRow({ companyName: 42, phoneNumber: "+15551234567" });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("companyName is required");
-    });
+describe("validateRows", () => {
+  it("marks duplicate phone numbers inside a batch", () => {
+    const result = validateRows([
+      {
+        company_name: "Acme",
+        employee_name: "Ada",
+        phone_number: "5551234567",
+      },
+      {
+        company_name: "Acme",
+        employee_name: "Grace",
+        phone_number: "+15551234567",
+      },
+    ]);
 
-    it("rejects blank phoneNumber", () => {
-      const result = normalizeRow({ companyName: "Acme", phoneNumber: "   " });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("phoneNumber is required");
-    });
-
-    it("rejects missing phoneNumber", () => {
-      const result = normalizeRow({ companyName: "Acme" });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("phoneNumber is required");
-    });
-
-    it("rejects unnormalizable phone number", () => {
-      const result = normalizeRow({ companyName: "Acme", phoneNumber: "not-a-phone" });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("E.164");
-    });
-
-    it("rejects malformed userEmail", () => {
-      const result = normalizeRow({
-        companyName: "Acme",
-        userEmail: "not-an-email",
-        phoneNumber: "+15551234567",
-      });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("userEmail");
-    });
-
-    it("preserves rawRecord reference for invalid rows", () => {
-      const raw = { companyName: "", phoneNumber: "bad" };
-      const result = normalizeRow(raw);
-      expect(result.status).toBe("validation_error");
-      expect(result.rawRecord).toBe(raw);
-    });
-
-    it("accumulates multiple errors in a single validationError string", () => {
-      const result = normalizeRow({ companyName: "", phoneNumber: "" });
-      expect(result.status).toBe("validation_error");
-      expect(result.validationError).toContain("companyName is required");
-      expect(result.validationError).toContain("phoneNumber is required");
-    });
-
-    it("returns empty normalizedRecord for invalid rows", () => {
-      const result = normalizeRow({ companyName: "", phoneNumber: "" });
-      expect(result.normalizedRecord).toEqual({});
-    });
+    expect(result.totalRows).toBe(2);
+    expect(result.validRows).toBe(1);
+    expect(result.invalidRows).toBe(1);
+    expect(result.duplicateRows).toBe(1);
+    expect(result.rows[1]?.detectedChangeType).toBe("duplicate");
   });
 });
 
 describe("validateEnvelope", () => {
-  it("returns null for a valid envelope", () => {
+  it("returns null for a valid legacy n8n envelope", () => {
     expect(
       validateEnvelope({
         sourceRunId: "run-001",
@@ -211,23 +189,16 @@ describe("validateEnvelope", () => {
     expect(validateEnvelope(42)).not.toBeNull();
   });
 
-  it("rejects blank sourceRunId", () => {
-    const err = validateEnvelope({ sourceRunId: "  ", rows: [{}] });
-    expect(err).toContain("sourceRunId");
-  });
-
-  it("rejects missing sourceRunId", () => {
-    const err = validateEnvelope({ rows: [{}] });
-    expect(err).toContain("sourceRunId");
-  });
-
-  it("rejects rows that is not an array", () => {
-    const err = validateEnvelope({ sourceRunId: "run-001", rows: "not-array" });
-    expect(err).toContain("rows");
-  });
-
-  it("rejects empty rows array", () => {
-    const err = validateEnvelope({ sourceRunId: "run-001", rows: [] });
-    expect(err).toContain("rows");
+  it("rejects invalid sourceRunId and rows fields", () => {
+    expect(validateEnvelope({ sourceRunId: "  ", rows: [{}] })).toContain(
+      "sourceRunId"
+    );
+    expect(validateEnvelope({ rows: [{}] })).toContain("sourceRunId");
+    expect(validateEnvelope({ sourceRunId: "run-001", rows: "no" })).toContain(
+      "rows"
+    );
+    expect(validateEnvelope({ sourceRunId: "run-001", rows: [] })).toContain(
+      "rows"
+    );
   });
 });
